@@ -27,6 +27,8 @@ import io.netty.handler.codec.http.HttpResponseEncoder;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.handler.proxy.Socks4ProxyHandler;
+import io.netty.handler.proxy.Socks5ProxyHandler;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.handler.traffic.GlobalTrafficShapingHandler;
 import io.netty.util.ReferenceCounted;
@@ -36,6 +38,7 @@ import org.littleshoot.proxy.ActivityTracker;
 import org.littleshoot.proxy.ChainedProxy;
 import org.littleshoot.proxy.ChainedProxyAdapter;
 import org.littleshoot.proxy.ChainedProxyManager;
+import org.littleshoot.proxy.ChainedSocksProxy;
 import org.littleshoot.proxy.FullFlowContext;
 import org.littleshoot.proxy.HttpFilters;
 import org.littleshoot.proxy.MitmManager;
@@ -84,6 +87,7 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
     private final String serverHostAndPort;
     private volatile ChainedProxy chainedProxy;
     private final Queue<ChainedProxy> availableChainedProxies;
+    private volatile boolean connectWithSocks;
 
     /**
      * The filters to apply to response/chunks received from server.
@@ -550,8 +554,9 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
         }
 
         if (ProxyUtils.isCONNECT(initialRequest)) {
-            // If we're chaining, forward the CONNECT request
-            if (hasUpstreamChainedProxy()) {
+            // If we're chaining, forward the CONNECT request. If we are a SOCKS
+            // proxy, we are already connected.
+            if (hasUpstreamChainedProxy() && !connectWithSocks) {
                 connectionFlow.then(
                         serverConnection.HTTPCONNECTWithChainedProxy);
             }        	
@@ -815,8 +820,14 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
     private void setupConnectionParameters() throws UnknownHostException {
         if (chainedProxy != null
                 && chainedProxy != ChainedProxyAdapter.FALLBACK_TO_DIRECT_CONNECTION) {
+            this.connectWithSocks = chainedProxy instanceof ChainedSocksProxy
+                    && ((ChainedSocksProxy) chainedProxy).isSocksProxy();
             this.transportProtocol = chainedProxy.getTransportProtocol();
-            this.remoteAddress = chainedProxy.getChainedProxyAddress();
+            if (connectWithSocks) {
+                this.remoteAddress = getSocksRemoteAddress();
+            } else {
+                this.remoteAddress = chainedProxy.getChainedProxyAddress();
+            }
             this.localAddress = chainedProxy.getLocalAddress();
         } else {
             this.transportProtocol = TransportProtocol.TCP;
@@ -849,6 +860,28 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
 
             this.localAddress = proxyServer.getLocalAddress();
         }
+    }
+
+    /**
+     * Prepares a socket address to be used with SOCKS proxies. Also supports
+     * the creation of unresolved addresses for SOCKS-5 resolving.
+     *
+     * @return The remote address to use with SOCKS proxies
+     * @throws UnknownHostException
+     *             when unable to parse the server host and port
+     */
+    private InetSocketAddress getSocksRemoteAddress() throws UnknownHostException {
+        if (((ChainedSocksProxy) chainedProxy).isSocks5Proxy()
+                && ((ChainedSocksProxy) chainedProxy).useSocks5Resolver()) {
+            HostAndPort hostAndPort;
+            try {
+                hostAndPort = HostAndPort.fromString(serverHostAndPort);
+            } catch (IllegalArgumentException e) {
+                throw new UnknownHostException(serverHostAndPort);
+            }
+            return InetSocketAddress.createUnresolved(hostAndPort.getHost(), hostAndPort.getPortOrDefault(80));
+        }
+        return addressFor(serverHostAndPort, proxyServer);
     }
 
     /**
@@ -899,6 +932,14 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
                         .getIdleConnectionTimeout()));
 
         pipeline.addLast("handler", this);
+
+        if (connectWithSocks) {
+            if (((ChainedSocksProxy) chainedProxy).isSocks5Proxy()) {
+                pipeline.addFirst(new Socks5ProxyHandler(chainedProxy.getChainedProxyAddress()));
+            } else {
+                pipeline.addFirst(new Socks4ProxyHandler(chainedProxy.getChainedProxyAddress()));
+            }
+        }
     }
 
     /**
